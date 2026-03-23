@@ -24,3 +24,7 @@ vault_vm_root_password: "CHANGE_ME_STRONG_PASSWORD"
 
 # Optional: Proxmox API validate SSL cert (set false for self-signed certs)
 vault_proxmox_validate_certs: false
+
+# Microsoft Teams incoming webhook URL for compute reports
+# Create via: Teams channel → Connectors → Incoming Webhook
+vault_teams_webhook_url: "https://YOURORG.webhook.office.com/webhookb2/CHANGE_ME"

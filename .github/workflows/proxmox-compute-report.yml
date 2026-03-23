@@ -1,0 +1,188 @@
+---
+# =============================================================================
+# GitHub Actions Workflow: Proxmox Compute Report
+# =============================================================================
+# Runs the proxmox_compute_report.yml playbook inside a Docker container.
+#
+# TRIGGER OPTIONS:
+#   - Manual:     Actions tab → "Run workflow" (one-click)
+#   - Scheduled:  Daily at 07:00 UTC (adjust cron as needed)
+#   - On push:    Changes to playbooks/ or vars/ auto-trigger a syntax check
+#
+# REQUIRED GITHUB SECRETS (Settings → Secrets and variables → Actions):
+#   PROXMOX_HOST            Proxmox FQDN or IP
+#   PROXMOX_PORT            Proxmox API port (default: 8006)
+#   PROXMOX_USER            Proxmox username (e.g. root@pam)
+#   PROXMOX_PASSWORD        Proxmox password   [Option A]
+#   PROXMOX_TOKEN_ID        API token ID       [Option B — preferred]
+#   PROXMOX_TOKEN_SECRET    API token secret   [Option B — preferred]
+#   PROXMOX_VALIDATE_CERTS  true/false
+#   TEAMS_WEBHOOK_URL       Teams incoming webhook URL (for notifications)
+#   ANSIBLE_VAULT_PASSWORD  Password to decrypt vars/vault.yml
+# =============================================================================
+
+name: "Proxmox Compute Report"
+
+on:
+  # ── One-click manual trigger ──────────────────────────────────────────────
+  workflow_dispatch:
+    inputs:
+      report_top_n:
+        description: "Number of top VMs to show per category"
+        required: false
+        default: "10"
+        type: string
+      include_lxc:
+        description: "Include LXC containers in the report"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      notify_teams:
+        description: "Send summary to Microsoft Teams"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      save_report:
+        description: "Upload JSON report as workflow artifact"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+  # ── Scheduled daily run ───────────────────────────────────────────────────
+  schedule:
+    - cron: "0 7 * * *"               # 07:00 UTC every day
+
+  # ── Syntax check on every push touching playbooks or vars ─────────────────
+  push:
+    branches: ["main", "master", "claude/**"]
+    paths:
+      - "playbooks/**"
+      - "vars/**"
+      - "requirements.yml"
+      - "requirements.txt"
+      - ".github/workflows/proxmox-compute-report.yml"
+
+env:
+  # Defaults for scheduled runs (workflow_dispatch overrides these)
+  DEFAULT_TOP_N: "10"
+  DEFAULT_LXC: "true"
+  DEFAULT_NOTIFY: "true"
+  DEFAULT_SAVE: "true"
+
+jobs:
+  # ===========================================================================
+  # JOB 1: Syntax check — runs on every push (fast, no secrets needed)
+  # ===========================================================================
+  syntax-check:
+    name: "Syntax Check"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build dev container image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: .devcontainer/Dockerfile
+          push: false
+          tags: ansible-proxmox:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run syntax check inside container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            ansible-proxmox:ci \
+            ansible-playbook playbooks/proxmox_compute_report.yml --syntax-check
+
+  # ===========================================================================
+  # JOB 2: Full compute report — manual trigger or scheduled
+  # ===========================================================================
+  compute-report:
+    name: "Run Compute Report"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Resolve inputs (use defaults for scheduled runs) ──────────────────
+      - name: Resolve run parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "top_n=${{ github.event.inputs.report_top_n }}"     >> "$GITHUB_OUTPUT"
+            echo "lxc=${{ github.event.inputs.include_lxc }}"        >> "$GITHUB_OUTPUT"
+            echo "teams=${{ github.event.inputs.notify_teams }}"     >> "$GITHUB_OUTPUT"
+            echo "save=${{ github.event.inputs.save_report }}"       >> "$GITHUB_OUTPUT"
+          else
+            echo "top_n=${{ env.DEFAULT_TOP_N }}"   >> "$GITHUB_OUTPUT"
+            echo "lxc=${{ env.DEFAULT_LXC }}"       >> "$GITHUB_OUTPUT"
+            echo "teams=${{ env.DEFAULT_NOTIFY }}"  >> "$GITHUB_OUTPUT"
+            echo "save=${{ env.DEFAULT_SAVE }}"     >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Write vault password file ─────────────────────────────────────────
+      - name: Write Ansible Vault password
+        run: |
+          echo "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > /tmp/.vault_pass
+          chmod 600 /tmp/.vault_pass
+
+      # ── Build container image (cached) ────────────────────────────────────
+      - name: Build dev container image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: .devcontainer/Dockerfile
+          push: false
+          tags: ansible-proxmox:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Run the playbook ──────────────────────────────────────────────────
+      - name: Run Proxmox compute report
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "/tmp/.vault_pass:/tmp/.vault_pass:ro" \
+            -w /workspace \
+            -e ANSIBLE_FORCE_COLOR=1 \
+            ansible-proxmox:ci \
+            ansible-playbook playbooks/proxmox_compute_report.yml \
+              --vault-password-file /tmp/.vault_pass \
+              -e vault_proxmox_host="${{ secrets.PROXMOX_HOST }}" \
+              -e vault_proxmox_port="${{ secrets.PROXMOX_PORT || '8006' }}" \
+              -e vault_proxmox_user="${{ secrets.PROXMOX_USER }}" \
+              -e vault_proxmox_password="${{ secrets.PROXMOX_PASSWORD }}" \
+              -e vault_proxmox_token_id="${{ secrets.PROXMOX_TOKEN_ID }}" \
+              -e vault_proxmox_token_secret="${{ secrets.PROXMOX_TOKEN_SECRET }}" \
+              -e vault_proxmox_validate_certs="${{ secrets.PROXMOX_VALIDATE_CERTS || 'false' }}" \
+              -e vault_teams_webhook_url="${{ secrets.TEAMS_WEBHOOK_URL }}" \
+              -e report_top_n="${{ steps.params.outputs.top_n }}" \
+              -e include_lxc="${{ steps.params.outputs.lxc }}" \
+              -e notify_teams="${{ steps.params.outputs.teams }}" \
+              -e save_report="${{ steps.params.outputs.save }}" \
+              -e report_dir="/workspace/reports"
+
+      # ── Upload JSON report artifact ───────────────────────────────────────
+      - name: Upload JSON report artifact
+        uses: actions/upload-artifact@v4
+        if: steps.params.outputs.save == 'true'
+        with:
+          name: "proxmox-compute-report-${{ github.run_id }}"
+          path: "reports/proxmox_compute_*.json"
+          retention-days: 30
+
+      # ── Clean up vault password ───────────────────────────────────────────
+      - name: Clean up vault password file
+        if: always()
+        run: rm -f /tmp/.vault_pass

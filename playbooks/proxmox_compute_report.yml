@@ -1,0 +1,658 @@
+---
+# =============================================================================
+# Playbook: proxmox_compute_report.yml
+# Description:
+#   Query Proxmox REST API across every node/cluster and produce a compute
+#   utilisation report:
+#     - Cluster-wide resource totals and averages
+#     - Per-node CPU / memory breakdown
+#     - Top N VMs by CPU usage
+#     - Top N VMs by memory usage
+#     - Top N VMs by disk usage
+#     - Top N VMs by uptime
+#     - Idle/underutilised VM list
+#     - Optional JSON report saved to disk
+#     - Microsoft Teams webhook notification with summary card
+#
+# Requirements:
+#   pip install netaddr
+#   vars/vault.yml populated and encrypted
+#   vault_teams_webhook_url set in vault.yml for Teams notifications
+#
+# Usage:
+#   ansible-playbook playbooks/proxmox_compute_report.yml \
+#     --vault-password-file ~/.vault_pass \
+#     [-e report_top_n=10] \
+#     [-e save_report=true] \
+#     [-e include_lxc=true] \
+#     [-e notify_teams=true]
+# =============================================================================
+
+- name: "Proxmox Cluster Compute Summary Report"
+  hosts: localhost
+  connection: local
+  gather_facts: true                    # needed for ansible_date_time
+
+  vars_files:
+    - ../vars/vault.yml
+
+  vars:
+    proxmox_api_base: "https://{{ vault_proxmox_host }}:{{ vault_proxmox_port }}/api2/json"
+    report_top_n: 10                    # how many VMs to show per category
+    save_report: false                  # set true to write JSON to disk
+    include_lxc: true                   # include LXC containers alongside QEMU VMs
+    report_dir: "../reports"
+    report_file: "{{ report_dir }}/proxmox_compute_{{ ansible_date_time.date }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}.json"
+    notify_teams: false                 # set true (or -e notify_teams=true) to send Teams card
+    teams_webhook_url: "{{ vault_teams_webhook_url | default('') }}"
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # Authentication — API token (preferred) or ticket auth
+    # -------------------------------------------------------------------------
+    - name: Detect authentication method
+      ansible.builtin.set_fact:
+        use_token_auth: "{{ vault_proxmox_token_id is defined and vault_proxmox_token_id | length > 0 }}"
+
+    - name: Authenticate — obtain session ticket (user/password)
+      ansible.builtin.uri:
+        url: "{{ proxmox_api_base }}/access/ticket"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          username: "{{ vault_proxmox_user }}"
+          password: "{{ vault_proxmox_password }}"
+        validate_certs: "{{ vault_proxmox_validate_certs }}"
+        status_code: 200
+      register: auth_response
+      no_log: true
+      check_mode: false                 # read-only auth — must run even in check mode
+      when: not use_token_auth
+
+    - name: Set auth headers — ticket
+      ansible.builtin.set_fact:
+        proxmox_headers:
+          Cookie: "PVEAuthCookie={{ auth_response.json.data.ticket }}"
+          CSRFPreventionToken: "{{ auth_response.json.data.CSRFPreventionToken }}"
+      no_log: true
+      when: not use_token_auth
+
+    - name: Set auth headers — API token
+      ansible.builtin.set_fact:
+        proxmox_headers:
+          Authorization: "PVEAPIToken={{ vault_proxmox_user }}!{{ vault_proxmox_token_id }}={{ vault_proxmox_token_secret }}"
+      no_log: true
+      when: use_token_auth
+
+    # -------------------------------------------------------------------------
+    # Fetch cluster status — detect multi-node vs standalone
+    # -------------------------------------------------------------------------
+    - name: Fetch cluster status
+      ansible.builtin.uri:
+        url: "{{ proxmox_api_base }}/cluster/status"
+        method: GET
+        headers: "{{ proxmox_headers }}"
+        validate_certs: "{{ vault_proxmox_validate_certs }}"
+        status_code: 200
+      register: cluster_status_raw
+      check_mode: false                 # read-only GET
+
+    - name: Extract cluster name and quorum info
+      ansible.builtin.set_fact:
+        cluster_info: "{{ cluster_status_raw.json.data | selectattr('type', 'equalto', 'cluster') | list | first | default({'name': vault_proxmox_host, 'quorate': 1, 'nodes': 1}) }}"
+
+    # -------------------------------------------------------------------------
+    # Fetch ALL resources in one call (VMs + nodes)
+    # /cluster/resources works on standalone nodes too
+    # -------------------------------------------------------------------------
+    - name: Fetch all cluster resources
+      ansible.builtin.uri:
+        url: "{{ proxmox_api_base }}/cluster/resources"
+        method: GET
+        headers: "{{ proxmox_headers }}"
+        validate_certs: "{{ vault_proxmox_validate_certs }}"
+        status_code: 200
+      register: cluster_resources_raw
+      check_mode: false                 # read-only GET
+
+    # -------------------------------------------------------------------------
+    # Fetch per-node CPU model / detailed hardware info
+    # -------------------------------------------------------------------------
+    - name: Get list of online node names
+      ansible.builtin.set_fact:
+        online_node_names: >-
+          {{ cluster_resources_raw.json.data
+             | selectattr('type', 'equalto', 'node')
+             | selectattr('status', 'equalto', 'online')
+             | map(attribute='node') | list }}
+
+    - name: Fetch detailed status for each node
+      ansible.builtin.uri:
+        url: "{{ proxmox_api_base }}/nodes/{{ item }}/status"
+        method: GET
+        headers: "{{ proxmox_headers }}"
+        validate_certs: "{{ vault_proxmox_validate_certs }}"
+        status_code: 200
+      check_mode: false                 # read-only GET
+      register: node_status_responses
+      loop: "{{ online_node_names }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Build node detail map (node_name → detail)
+      ansible.builtin.set_fact:
+        node_detail_map: >-
+          {%- set result = {} -%}
+          {%- for resp in node_status_responses.results -%}
+            {%- set d = resp.json.data -%}
+            {%- set _ = result.update({resp.item: {
+              'cpu_model': d.cpuinfo.model   | default('unknown'),
+              'cpu_sockets': d.cpuinfo.sockets | default(1),
+              'cpu_cores':   d.cpuinfo.cores   | default(1),
+              'pveversion':  d.pveversion      | default('unknown'),
+              'kversion':    d.kversion        | default('unknown'),
+              'loadavg':     d.loadavg         | default([0,0,0])
+            }}) -%}
+          {%- endfor -%}
+          {{ result }}
+
+    # -------------------------------------------------------------------------
+    # Separate and filter raw resource data
+    # -------------------------------------------------------------------------
+    - name: Separate VMs, containers, and nodes
+      ansible.builtin.set_fact:
+        raw_qemu:  "{{ cluster_resources_raw.json.data | selectattr('type', 'equalto', 'qemu') | list }}"
+        raw_lxc:   "{{ cluster_resources_raw.json.data | selectattr('type', 'equalto', 'lxc')  | list }}"
+        raw_nodes: "{{ cluster_resources_raw.json.data | selectattr('type', 'equalto', 'node') | list }}"
+
+    - name: Build combined VM list (QEMU + optional LXC)
+      ansible.builtin.set_fact:
+        all_vms: "{{ raw_qemu + (raw_lxc if include_lxc else []) }}"
+
+    - name: Split running vs stopped VMs
+      ansible.builtin.set_fact:
+        running_vms: "{{ all_vms | selectattr('status', 'equalto', 'running') | list }}"
+        stopped_vms: "{{ all_vms | rejectattr('status', 'equalto', 'running') | list }}"
+
+    - name: Guard — abort gracefully if no VMs found
+      ansible.builtin.assert:
+        that: all_vms | length > 0
+        fail_msg: "No VMs or containers found via Proxmox API. Check permissions or template filter."
+        success_msg: "Found {{ all_vms | length }} VMs/containers ({{ running_vms | length }} running)."
+
+    # -------------------------------------------------------------------------
+    # Enrich nodes with computed metrics
+    # -------------------------------------------------------------------------
+    - name: Enrich node metrics
+      ansible.builtin.set_fact:
+        enriched_nodes: >-
+          {%- set result = [] -%}
+          {%- for n in raw_nodes -%}
+            {%- set cpu_pct    = (n.cpu * 100) | round(2) -%}
+            {%- set mem_pct    = ((n.mem / n.maxmem) * 100) | round(2) if n.maxmem > 0 else 0 -%}
+            {%- set mem_gb     = (n.mem    / 1073741824) | round(2) -%}
+            {%- set maxmem_gb  = (n.maxmem / 1073741824) | round(2) -%}
+            {%- set uptime_d   = (n.uptime  / 86400)      | round(1) -%}
+            {%- set detail     = node_detail_map.get(n.node, {}) -%}
+            {%- set _ = result.append(n | combine({
+              'cpu_pct':    cpu_pct   | float,
+              'mem_pct':    mem_pct   | float,
+              'mem_gb':     mem_gb    | float,
+              'maxmem_gb':  maxmem_gb | float,
+              'uptime_d':   uptime_d  | float,
+              'cpu_model':  detail.get('cpu_model', 'N/A'),
+              'pveversion': detail.get('pveversion', 'N/A'),
+              'loadavg':    detail.get('loadavg', [0,0,0])
+            })) -%}
+          {%- endfor -%}
+          {{ result }}
+
+    # -------------------------------------------------------------------------
+    # Enrich VMs with computed utilisation metrics
+    # -------------------------------------------------------------------------
+    - name: Enrich VM metrics (running VMs only)
+      ansible.builtin.set_fact:
+        enriched_vms: >-
+          {%- set result = [] -%}
+          {%- for vm in running_vms -%}
+            {%- set cpu_pct      = (vm.cpu * 100) | round(2) -%}
+            {%- set mem_pct      = ((vm.mem    / vm.maxmem)  * 100) | round(2) if vm.maxmem  > 0 else 0 -%}
+            {%- set disk_pct     = ((vm.disk   / vm.maxdisk) * 100) | round(2) if vm.maxdisk > 0 else 0 -%}
+            {%- set mem_used_gb  = (vm.mem    / 1073741824) | round(2) -%}
+            {%- set mem_max_gb   = (vm.maxmem  / 1073741824) | round(2) -%}
+            {%- set disk_used_gb = (vm.disk   / 1073741824) | round(2) -%}
+            {%- set disk_max_gb  = (vm.maxdisk / 1073741824) | round(2) -%}
+            {%- set uptime_h     = (vm.uptime  / 3600)       | round(1) -%}
+            {%- set netin_mb     = (vm.netin   / 1048576)    | round(2) if vm.netin   is defined else 0 -%}
+            {%- set netout_mb    = (vm.netout  / 1048576)    | round(2) if vm.netout  is defined else 0 -%}
+            {%- set _ = result.append(vm | combine({
+              'cpu_pct':      cpu_pct      | float,
+              'mem_pct':      mem_pct      | float,
+              'disk_pct':     disk_pct     | float,
+              'mem_used_gb':  mem_used_gb  | float,
+              'mem_max_gb':   mem_max_gb   | float,
+              'disk_used_gb': disk_used_gb | float,
+              'disk_max_gb':  disk_max_gb  | float,
+              'uptime_h':     uptime_h     | float,
+              'netin_mb':     netin_mb     | float,
+              'netout_mb':    netout_mb    | float
+            })) -%}
+          {%- endfor -%}
+          {{ result }}
+
+    # -------------------------------------------------------------------------
+    # Cluster-wide aggregate totals
+    # -------------------------------------------------------------------------
+    - name: Calculate cluster-wide totals
+      ansible.builtin.set_fact:
+        cluster_totals:
+          total_nodes:         "{{ raw_nodes | length }}"
+          online_nodes:        "{{ raw_nodes | selectattr('status', 'equalto', 'online') | list | length }}"
+          total_vms:           "{{ all_vms | length }}"
+          running_vms:         "{{ running_vms | length }}"
+          stopped_vms:         "{{ stopped_vms | length }}"
+          qemu_count:          "{{ raw_qemu | length }}"
+          lxc_count:           "{{ raw_lxc  | length }}"
+          total_vcpus_alloc:   "{{ running_vms | sum(attribute='maxcpu') | int }}"
+          total_mem_used_gb:   "{{ (running_vms | sum(attribute='mem')    / 1073741824) | round(2) }}"
+          total_mem_alloc_gb:  "{{ (running_vms | sum(attribute='maxmem') / 1073741824) | round(2) }}"
+          total_disk_used_gb:  "{{ (all_vms | sum(attribute='disk')    / 1073741824) | round(2) }}"
+          total_disk_alloc_gb: "{{ (all_vms | sum(attribute='maxdisk') / 1073741824) | round(2) }}"
+          avg_cpu_pct:  "{{ ((enriched_vms | map(attribute='cpu_pct')  | list | sum) / (enriched_vms | length)) | round(2) if enriched_vms | length > 0 else 0 }}"
+          avg_mem_pct:  "{{ ((enriched_vms | map(attribute='mem_pct')  | list | sum) / (enriched_vms | length)) | round(2) if enriched_vms | length > 0 else 0 }}"
+          avg_disk_pct: "{{ ((enriched_vms | map(attribute='disk_pct') | list | sum) / (enriched_vms | length)) | round(2) if enriched_vms | length > 0 else 0 }}"
+          mem_overcommit_pct: >-
+            {{ (((running_vms | sum(attribute='maxmem')) /
+                 (raw_nodes   | selectattr('status','equalto','online') | sum(attribute='maxmem'))) * 100) | round(1)
+               if (raw_nodes | selectattr('status','equalto','online') | sum(attribute='maxmem')) > 0 else 'N/A' }}
+
+    # -------------------------------------------------------------------------
+    # Sort top-N lists for each resource dimension
+    # -------------------------------------------------------------------------
+    - name: Build top-N sorted VM lists
+      ansible.builtin.set_fact:
+        top_cpu_vms:    "{{ (enriched_vms | sort(attribute='cpu_pct',  reverse=True))[:report_top_n | int] }}"
+        top_mem_vms:    "{{ (enriched_vms | sort(attribute='mem_pct',  reverse=True))[:report_top_n | int] }}"
+        top_disk_vms:   "{{ (enriched_vms | sort(attribute='disk_pct', reverse=True))[:report_top_n | int] }}"
+        top_uptime_vms: "{{ (enriched_vms | sort(attribute='uptime_h', reverse=True))[:report_top_n | int] }}"
+
+    # =========================================================================
+    # R E P O R T S
+    # =========================================================================
+
+    - name: "REPORT | Cluster Overview"
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - "  PROXMOX CLUSTER COMPUTE SUMMARY REPORT"
+          - "  Cluster  : {{ cluster_info.name | default(vault_proxmox_host) }}"
+          - "  Host     : {{ vault_proxmox_host }}:{{ vault_proxmox_port }}"
+          - "  Generated: {{ ansible_date_time.iso8601 }}"
+          - "=================================================================="
+          - ""
+          - "  INFRASTRUCTURE"
+          - "  ──────────────────────────────────────────────────────────────"
+          - "  Nodes    : {{ cluster_totals.online_nodes }} online / {{ cluster_totals.total_nodes }} total"
+          - "  VMs      : {{ cluster_totals.running_vms }} running / {{ cluster_totals.total_vms }} total  ({{ cluster_totals.stopped_vms }} stopped)"
+          - "  QEMU VMs : {{ cluster_totals.qemu_count }}   LXC containers: {{ cluster_totals.lxc_count }}"
+          - ""
+          - "  ALLOCATED RESOURCES (running VMs)"
+          - "  ──────────────────────────────────────────────────────────────"
+          - "  vCPUs    : {{ cluster_totals.total_vcpus_alloc }}"
+          - "  Memory   : {{ cluster_totals.total_mem_used_gb }} GB used / {{ cluster_totals.total_mem_alloc_gb }} GB allocated"
+          - "  Disk     : {{ cluster_totals.total_disk_used_gb }} GB used / {{ cluster_totals.total_disk_alloc_gb }} GB allocated"
+          - "  Mem over-commit vs physical: {{ cluster_totals.mem_overcommit_pct }}%"
+          - ""
+          - "  AVERAGE UTILISATION (running VMs)"
+          - "  ──────────────────────────────────────────────────────────────"
+          - "  CPU avg  : {{ cluster_totals.avg_cpu_pct }}%"
+          - "  MEM avg  : {{ cluster_totals.avg_mem_pct }}%"
+          - "  Disk avg : {{ cluster_totals.avg_disk_pct }}%"
+
+    - name: "REPORT | Per-Node Breakdown"
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      loop: >-
+        {%- set lines = [] -%}
+        {%- set _ = lines.append('') -%}
+        {%- set _ = lines.append('  PER-NODE BREAKDOWN') -%}
+        {%- set _ = lines.append('  ==================================================================') -%}
+        {%- for n in enriched_nodes | sort(attribute='node') -%}
+          {%- set _ = lines.append('') -%}
+          {%- set _ = lines.append('  Node       : ' + n.node + '  [' + n.status | upper + ']  PVE: ' + n.pveversion) -%}
+          {%- set _ = lines.append('  CPU        : ' + n.maxcpu | string + ' cores  |  Current load: ' + n.cpu_pct | string + '%  |  Load avg: ' + n.loadavg | join(' / ')) -%}
+          {%- set _ = lines.append('  CPU Model  : ' + n.cpu_model) -%}
+          {%- set _ = lines.append('  Memory     : ' + n.mem_gb | string + ' GB used / ' + n.maxmem_gb | string + ' GB total  (' + n.mem_pct | string + '%)') -%}
+          {%- set _ = lines.append('  Uptime     : ' + n.uptime_d | string + ' days') -%}
+          {%- set node_vms = enriched_vms | selectattr('node', 'equalto', n.node) | list -%}
+          {%- set _ = lines.append('  Running VMs: ' + node_vms | length | string) -%}
+          {%- set _ = lines.append('  ──────────────────────────────────────────────────────────────') -%}
+        {%- endfor -%}
+        {{ lines }}
+      loop_control:
+        label: "node_breakdown"
+
+    - name: "REPORT | Top {{ report_top_n }} VMs by CPU Usage"
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      loop: >-
+        {%- set lines = [] -%}
+        {%- set _ = lines.append('') -%}
+        {%- set _ = lines.append('  TOP ' + report_top_n | string + ' VMs  —  CPU USAGE') -%}
+        {%- set _ = lines.append('  ==================================================================') -%}
+        {%- set _ = lines.append('  Rank  VM Name                    Node          Type    vCPU   CPU%    MEM%') -%}
+        {%- set _ = lines.append('  ──────────────────────────────────────────────────────────────────────────') -%}
+        {%- for vm in top_cpu_vms -%}
+          {%- set _ = lines.append(
+            '  ' + '%2d' | format(loop.index) + '.   ' +
+            '%-26s' | format(vm.name) +
+            '%-14s' | format(vm.node) +
+            '%-8s'  | format(vm.type | upper) +
+            '%4s'   | format(vm.maxcpu) + '   ' +
+            '%5s'   | format(vm.cpu_pct | string + '%') + '   ' +
+            '%5s'   | format(vm.mem_pct | string + '%')
+          ) -%}
+        {%- endfor -%}
+        {{ lines }}
+      loop_control:
+        label: "top_cpu"
+
+    - name: "REPORT | Top {{ report_top_n }} VMs by Memory Usage"
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      loop: >-
+        {%- set lines = [] -%}
+        {%- set _ = lines.append('') -%}
+        {%- set _ = lines.append('  TOP ' + report_top_n | string + ' VMs  —  MEMORY USAGE') -%}
+        {%- set _ = lines.append('  ==================================================================') -%}
+        {%- set _ = lines.append('  Rank  VM Name                    Node          Type    MEM Used    Alloc    MEM%') -%}
+        {%- set _ = lines.append('  ──────────────────────────────────────────────────────────────────────────────') -%}
+        {%- for vm in top_mem_vms -%}
+          {%- set _ = lines.append(
+            '  ' + '%2d' | format(loop.index) + '.   ' +
+            '%-26s' | format(vm.name) +
+            '%-14s' | format(vm.node) +
+            '%-8s'  | format(vm.type | upper) +
+            '%7s'   | format(vm.mem_used_gb | string + ' GB') + '   ' +
+            '%7s'   | format(vm.mem_max_gb  | string + ' GB') + '   ' +
+            '%5s'   | format(vm.mem_pct | string + '%')
+          ) -%}
+        {%- endfor -%}
+        {{ lines }}
+      loop_control:
+        label: "top_memory"
+
+    - name: "REPORT | Top {{ report_top_n }} VMs by Disk Usage"
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      loop: >-
+        {%- set lines = [] -%}
+        {%- set _ = lines.append('') -%}
+        {%- set _ = lines.append('  TOP ' + report_top_n | string + ' VMs  —  DISK USAGE') -%}
+        {%- set _ = lines.append('  ==================================================================') -%}
+        {%- set _ = lines.append('  Rank  VM Name                    Node          Type    Disk Used   Alloc    Disk%') -%}
+        {%- set _ = lines.append('  ──────────────────────────────────────────────────────────────────────────────') -%}
+        {%- for vm in top_disk_vms -%}
+          {%- set _ = lines.append(
+            '  ' + '%2d' | format(loop.index) + '.   ' +
+            '%-26s' | format(vm.name) +
+            '%-14s' | format(vm.node) +
+            '%-8s'  | format(vm.type | upper) +
+            '%8s'   | format(vm.disk_used_gb | string + ' GB') + '   ' +
+            '%7s'   | format(vm.disk_max_gb  | string + ' GB') + '   ' +
+            '%5s'   | format(vm.disk_pct | string + '%')
+          ) -%}
+        {%- endfor -%}
+        {{ lines }}
+      loop_control:
+        label: "top_disk"
+
+    - name: "REPORT | Top {{ report_top_n }} VMs by Uptime (longest running)"
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      loop: >-
+        {%- set lines = [] -%}
+        {%- set _ = lines.append('') -%}
+        {%- set _ = lines.append('  TOP ' + report_top_n | string + ' VMs  —  UPTIME (longest running)') -%}
+        {%- set _ = lines.append('  ==================================================================') -%}
+        {%- set _ = lines.append('  Rank  VM Name                    Node          Type    Uptime (h)   CPU%    MEM%') -%}
+        {%- set _ = lines.append('  ──────────────────────────────────────────────────────────────────────────────') -%}
+        {%- for vm in top_uptime_vms -%}
+          {%- set _ = lines.append(
+            '  ' + '%2d' | format(loop.index) + '.   ' +
+            '%-26s' | format(vm.name) +
+            '%-14s' | format(vm.node) +
+            '%-8s'  | format(vm.type | upper) +
+            '%10s'  | format(vm.uptime_h | string + ' h') + '   ' +
+            '%5s'   | format(vm.cpu_pct | string + '%') + '   ' +
+            '%5s'   | format(vm.mem_pct | string + '%')
+          ) -%}
+        {%- endfor -%}
+        {{ lines }}
+      loop_control:
+        label: "top_uptime"
+
+    - name: "REPORT | Idle / Underutilised VMs (CPU < 5%)"
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      loop: >-
+        {%- set idle = enriched_vms | selectattr('cpu_pct', 'lt', 5.0) | sort(attribute='cpu_pct') | list -%}
+        {%- set lines = [] -%}
+        {%- set _ = lines.append('') -%}
+        {%- set _ = lines.append('  IDLE / UNDERUTILISED VMs  (CPU < 5%)  — candidates for rightsizing') -%}
+        {%- set _ = lines.append('  ==================================================================') -%}
+        {%- if idle | length == 0 -%}
+          {%- set _ = lines.append('  None — all running VMs are above 5% CPU.') -%}
+        {%- else -%}
+          {%- set _ = lines.append('  Count: ' + idle | length | string + ' VMs') -%}
+          {%- set _ = lines.append('') -%}
+          {%- set _ = lines.append('  VM Name                    Node          Type    CPU%    MEM%    Uptime (h)') -%}
+          {%- set _ = lines.append('  ──────────────────────────────────────────────────────────────────────────') -%}
+          {%- for vm in idle -%}
+            {%- set _ = lines.append(
+              '  %-26s' | format(vm.name) +
+              '%-14s' | format(vm.node) +
+              '%-8s'  | format(vm.type | upper) +
+              '%5s'   | format(vm.cpu_pct | string + '%') + '   ' +
+              '%5s'   | format(vm.mem_pct | string + '%') + '   ' +
+              '%10s'  | format(vm.uptime_h | string + ' h')
+            ) -%}
+          {%- endfor -%}
+        {%- endif -%}
+        {{ lines }}
+      loop_control:
+        label: "idle_vms"
+
+    # -------------------------------------------------------------------------
+    # Optional — save full JSON report to disk
+    # -------------------------------------------------------------------------
+    - name: Create reports directory
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      when: save_report | bool
+
+    - name: Save full JSON report to disk
+      ansible.builtin.copy:
+        content: "{{ report_payload | to_nice_json }}"
+        dest: "{{ report_file }}"
+        mode: "0644"
+      vars:
+        report_payload:
+          meta:
+            generated_at:  "{{ ansible_date_time.iso8601 }}"
+            proxmox_host:  "{{ vault_proxmox_host }}"
+            cluster_name:  "{{ cluster_info.name | default(vault_proxmox_host) }}"
+            report_top_n:  "{{ report_top_n }}"
+          summary:         "{{ cluster_totals }}"
+          nodes:           "{{ enriched_nodes }}"
+          top_cpu_vms:     "{{ top_cpu_vms }}"
+          top_mem_vms:     "{{ top_mem_vms }}"
+          top_disk_vms:    "{{ top_disk_vms }}"
+          top_uptime_vms:  "{{ top_uptime_vms }}"
+          all_running_vms: "{{ enriched_vms | sort(attribute='cpu_pct', reverse=True) }}"
+          stopped_vms:     "{{ stopped_vms  | map(attribute='name') | list }}"
+      when: save_report | bool
+
+    - name: Confirm report location
+      ansible.builtin.debug:
+        msg: "JSON report saved → {{ report_file }}"
+      when: save_report | bool
+
+    # -------------------------------------------------------------------------
+    # Microsoft Teams webhook notification
+    # Sends an Adaptive Card summary to a Teams channel.
+    # Requires: vault_teams_webhook_url in vault.yml
+    #           notify_teams=true (CLI flag or vars)
+    # -------------------------------------------------------------------------
+    - name: Validate Teams webhook URL is configured
+      ansible.builtin.assert:
+        that:
+          - teams_webhook_url | length > 0
+          - teams_webhook_url != ""
+        fail_msg: "notify_teams=true but vault_teams_webhook_url is not set in vault.yml"
+      when: notify_teams | bool
+
+    - name: Build top-5 CPU VM rows for Teams card
+      ansible.builtin.set_fact:
+        teams_top5_cpu: >-
+          {%- set rows = [] -%}
+          {%- for vm in (enriched_vms | sort(attribute='cpu_pct', reverse=True))[:5] -%}
+            {%- set _ = rows.append(
+              '**' + vm.name + '** `' + vm.node + '`  CPU: **' + vm.cpu_pct | string + '%**  MEM: ' + vm.mem_pct | string + '%  vCPU: ' + vm.maxcpu | string
+            ) -%}
+          {%- endfor -%}
+          {{ rows | join('\n\n') }}
+
+    - name: Build top-5 memory VM rows for Teams card
+      ansible.builtin.set_fact:
+        teams_top5_mem: >-
+          {%- set rows = [] -%}
+          {%- for vm in (enriched_vms | sort(attribute='mem_pct', reverse=True))[:5] -%}
+            {%- set _ = rows.append(
+              '**' + vm.name + '** `' + vm.node + '`  MEM: **' + vm.mem_used_gb | string + ' / ' + vm.mem_max_gb | string + ' GB (' + vm.mem_pct | string + '%)**'
+            ) -%}
+          {%- endfor -%}
+          {{ rows | join('\n\n') }}
+
+    - name: Post compute summary to Microsoft Teams
+      ansible.builtin.uri:
+        url: "{{ teams_webhook_url }}"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        body:
+          type: "message"
+          attachments:
+            - contentType: "application/vnd.microsoft.card.adaptive"
+              content:
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json"
+                type: "AdaptiveCard"
+                version: "1.4"
+                msteams:
+                  width: "Full"
+                body:
+                  - type: "Container"
+                    style: "emphasis"
+                    items:
+                      - type: "ColumnSet"
+                        columns:
+                          - type: "Column"
+                            width: "stretch"
+                            items:
+                              - type: "TextBlock"
+                                text: "Proxmox Compute Report"
+                                weight: "Bolder"
+                                size: "Large"
+                                color: "Accent"
+                              - type: "TextBlock"
+                                text: "Cluster: **{{ cluster_info.name | default(vault_proxmox_host) }}**  |  {{ ansible_date_time.iso8601 }}"
+                                isSubtle: true
+                                wrap: true
+
+                  - type: "FactSet"
+                    facts:
+                      - title: "Nodes"
+                        value: "{{ cluster_totals.online_nodes }} online / {{ cluster_totals.total_nodes }} total"
+                      - title: "VMs"
+                        value: "{{ cluster_totals.running_vms }} running / {{ cluster_totals.total_vms }} total ({{ cluster_totals.stopped_vms }} stopped)"
+                      - title: "vCPUs allocated"
+                        value: "{{ cluster_totals.total_vcpus_alloc }}"
+                      - title: "Memory"
+                        value: "{{ cluster_totals.total_mem_used_gb }} GB used / {{ cluster_totals.total_mem_alloc_gb }} GB allocated"
+                      - title: "Disk"
+                        value: "{{ cluster_totals.total_disk_used_gb }} GB used / {{ cluster_totals.total_disk_alloc_gb }} GB allocated"
+                      - title: "Mem over-commit"
+                        value: "{{ cluster_totals.mem_overcommit_pct }}%"
+
+                  - type: "TextBlock"
+                    text: "Average Utilisation"
+                    weight: "Bolder"
+                    spacing: "Medium"
+
+                  - type: "ColumnSet"
+                    columns:
+                      - type: "Column"
+                        width: "stretch"
+                        items:
+                          - type: "TextBlock"
+                            text: "CPU avg"
+                            isSubtle: true
+                          - type: "TextBlock"
+                            text: "{{ cluster_totals.avg_cpu_pct }}%"
+                            weight: "Bolder"
+                            size: "ExtraLarge"
+                            color: "{{ 'Attention' if cluster_totals.avg_cpu_pct | float > 80 else ('Warning' if cluster_totals.avg_cpu_pct | float > 60 else 'Good') }}"
+                      - type: "Column"
+                        width: "stretch"
+                        items:
+                          - type: "TextBlock"
+                            text: "MEM avg"
+                            isSubtle: true
+                          - type: "TextBlock"
+                            text: "{{ cluster_totals.avg_mem_pct }}%"
+                            weight: "Bolder"
+                            size: "ExtraLarge"
+                            color: "{{ 'Attention' if cluster_totals.avg_mem_pct | float > 80 else ('Warning' if cluster_totals.avg_mem_pct | float > 60 else 'Good') }}"
+                      - type: "Column"
+                        width: "stretch"
+                        items:
+                          - type: "TextBlock"
+                            text: "Disk avg"
+                            isSubtle: true
+                          - type: "TextBlock"
+                            text: "{{ cluster_totals.avg_disk_pct }}%"
+                            weight: "Bolder"
+                            size: "ExtraLarge"
+                            color: "{{ 'Attention' if cluster_totals.avg_disk_pct | float > 80 else ('Warning' if cluster_totals.avg_disk_pct | float > 60 else 'Good') }}"
+
+                  - type: "TextBlock"
+                    text: "Top 5 VMs — CPU"
+                    weight: "Bolder"
+                    spacing: "Medium"
+
+                  - type: "TextBlock"
+                    text: "{{ teams_top5_cpu }}"
+                    wrap: true
+
+                  - type: "TextBlock"
+                    text: "Top 5 VMs — Memory"
+                    weight: "Bolder"
+                    spacing: "Medium"
+
+                  - type: "TextBlock"
+                    text: "{{ teams_top5_mem }}"
+                    wrap: true
+
+        validate_certs: true
+        status_code: [200, 202]
+      register: teams_response
+      when: notify_teams | bool
+
+    - name: Confirm Teams notification sent
+      ansible.builtin.debug:
+        msg: "Teams notification delivered (HTTP {{ teams_response.status }})"
+      when: notify_teams | bool
