@@ -1,0 +1,27 @@
+# Vault password files - NEVER commit these
+.vault_pass
+*.vault_pass
+vault_pass.txt
+
+# Only commit vars/vault.yml if it is encrypted (ansible-vault encrypt vars/vault.yml first)
+# Uncomment the line below to block committing it entirely:
+# vars/vault.yml
+
+# SSH private keys
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Ansible retry files
+*.retry
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp

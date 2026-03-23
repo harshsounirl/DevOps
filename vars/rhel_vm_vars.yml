@@ -1,0 +1,81 @@
+# ------------------------------------------------------------
+# RHEL VM Provisioning Variables
+# ------------------------------------------------------------
+
+# --- Proxmox Node & Template ---
+proxmox_node: "pve"                  # Proxmox node name (check Proxmox UI)
+proxmox_storage: "local-lvm"         # Storage pool for VM disk
+
+template_vmid: 9000                  # VMID of the existing RHEL template
+template_name: "rhel9-template"      # Template name (for reference only)
+
+# --- New VM Settings ---
+new_vm_name: "rhel9-auto-01"         # Hostname and VM name
+new_vm_id: 101                       # Unique VMID for the new VM (must not exist)
+new_vm_description: "RHEL9 VM provisioned by Ansible"
+
+# --- Resources ---
+vm_cores: 2
+vm_sockets: 1
+vm_memory_mb: 4096                   # RAM in MB
+vm_disk_size: "40G"                  # Additional disk resize after clone (leave blank to keep template size)
+vm_os_type: "l26"                    # Linux 2.6+ kernel
+
+# --- Network ---
+vm_network_bridge: "vmbr0"
+vm_ip_cidr: "192.168.1.100/24"       # Static IP with prefix, e.g. 192.168.1.100/24
+vm_gateway: "192.168.1.1"
+vm_dns1: "8.8.8.8"
+vm_dns2: "8.8.4.4"
+vm_domain: "example.com"
+
+# --- Cloud-Init ---
+# Cloud-init requires the template to have a cloud-init drive attached.
+vm_cloudinit_user: "ansible"         # Default admin user created by cloud-init
+vm_cloudinit_upgrade: true           # Run package upgrade on first boot
+
+# --- SSH connection details (used by second play) ---
+ansible_user: "ansible"              # Must match vm_cloudinit_user above
+ansible_ssh_private_key_file: "~/.ssh/id_rsa"
+ansible_become: true
+ansible_become_method: sudo
+
+# --- Wait / retry settings ---
+vm_start_retries: 30                 # Number of retries waiting for SSH
+vm_start_delay: 10                   # Seconds between each retry
+
+# ------------------------------------------------------------
+# Users to create on the VM
+# Each user will be:
+#   - Added to the 'wheel' group (sudo access)
+#   - Have their SSH public key(s) installed
+# ------------------------------------------------------------
+vm_users:
+  - name: "alice"
+    comment: "Alice Admin"
+    ssh_public_keys:
+      - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC... alice@workstation"
+      # add more keys for this user if needed
+
+  - name: "bob"
+    comment: "Bob DevOps"
+    ssh_public_keys:
+      - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQD... bob@laptop"
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... bob@desktop"
+
+  - name: "svcansible"
+    comment: "Ansible Service Account"
+    ssh_public_keys:
+      - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC... ansible-controller"
+
+# --- DNF packages to install after update ---
+extra_packages:
+  - bash-completion
+  - vim
+  - tmux
+  - net-tools
+  - bind-utils
+  - python3
+  - python3-pip
+  - firewalld
+  - chrony
