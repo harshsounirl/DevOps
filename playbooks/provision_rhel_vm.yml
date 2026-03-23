@@ -57,7 +57,7 @@
     # Clone the RHEL template
     # -------------------------------------------------------------------------
     - name: Clone RHEL template to new VM
-      community.general.proxmox_kvm:
+      community.proxmox.proxmox_kvm:
         api_host: "{{ vault_proxmox_host }}"
         api_port: "{{ vault_proxmox_port }}"
         api_user: "{{ vault_proxmox_user }}"
@@ -82,7 +82,7 @@
     # Configure VM resources
     # -------------------------------------------------------------------------
     - name: Configure VM CPU, RAM, and options
-      community.general.proxmox_kvm:
+      community.proxmox.proxmox_kvm:
         api_host: "{{ vault_proxmox_host }}"
         api_port: "{{ vault_proxmox_port }}"
         api_user: "{{ vault_proxmox_user }}"
@@ -102,7 +102,7 @@
     # Configure cloud-init (network, credentials, SSH keys, upgrade)
     # -------------------------------------------------------------------------
     - name: Configure cloud-init settings
-      community.general.proxmox_kvm:
+      community.proxmox.proxmox_kvm:
         api_host: "{{ vault_proxmox_host }}"
         api_port: "{{ vault_proxmox_port }}"
         api_user: "{{ vault_proxmox_user }}"
@@ -126,7 +126,7 @@
     # Resize disk if requested
     # -------------------------------------------------------------------------
     - name: Resize VM disk
-      community.general.proxmox_disk:
+      community.proxmox.proxmox_disk:
         api_host: "{{ vault_proxmox_host }}"
         api_port: "{{ vault_proxmox_port }}"
         api_user: "{{ vault_proxmox_user }}"
@@ -142,7 +142,7 @@
     # Start the VM
     # -------------------------------------------------------------------------
     - name: Start the VM
-      community.general.proxmox_kvm:
+      community.proxmox.proxmox_kvm:
         api_host: "{{ vault_proxmox_host }}"
         api_port: "{{ vault_proxmox_port }}"
         api_user: "{{ vault_proxmox_user }}"
