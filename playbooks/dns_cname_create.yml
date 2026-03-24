@@ -1,0 +1,228 @@
+---
+# =============================================================================
+# Playbook: dns_cname_create.yml
+# Description:
+#   Creates DNS CNAME records on a Windows DNS server by running PowerShell
+#   Core (pwsh) on the domain-joined RHEL VM that was just provisioned.
+#
+#   The VM connects to the Windows DNS server via WinRM using Invoke-Command
+#   and an AD service account stored in vault.  The task is fully idempotent —
+#   existing CNAMEs are left untouched.
+#
+#   Can be run standalone or chained after provision_rhel_vm.yml via
+#   `import_playbook` (example at the bottom of provision_rhel_vm.yml).
+#
+# Flow:
+#   Ansible controller
+#     └─ SSH ──► domain-joined RHEL VM (pwsh installed)
+#                  └─ WinRM (Invoke-Command) ──► Windows DNS server
+#                       service account: vault_dns_svc_account
+#
+# Requirements:
+#   - PowerShell Core (pwsh) installed on the RHEL VM
+#     (play 1 ensures it via dnf if missing)
+#   - Service account must have "DNS Administrators" or delegated
+#     create-record rights on the DNS zone
+#   - WinRM (port 5985/5986) reachable from the VM to the DNS server
+#   - vars/dns_vars.yml and vars/vault.yml populated
+#
+# Usage:
+#   # Standalone against an existing VM:
+#   ansible-playbook playbooks/dns_cname_create.yml \
+#     --vault-password-file ~/.vault_pass \
+#     -i "rhel9-auto-01.example.com," \
+#     [-e dns_zone=example.com] \
+#     [-e @vars/dns_vars.yml]
+#
+#   # Automatically chained after provisioning (add to provision_rhel_vm.yml):
+#   - import_playbook: dns_cname_create.yml
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# PLAY 1 — Ensure PowerShell Core is installed on the domain-joined VM
+# ---------------------------------------------------------------------------
+- name: "DNS | Ensure PowerShell Core is available on the VM"
+  hosts: "{{ target_vm_group | default('dns_cname_hosts') }}"
+  gather_facts: true
+  become: true
+
+  vars_files:
+    - ../vars/vault.yml
+    - ../vars/dns_vars.yml
+
+  tasks:
+
+    - name: Check if pwsh is already installed
+      ansible.builtin.command: pwsh --version
+      register: pwsh_check
+      changed_when: false
+      failed_when: false
+
+    - name: Add Microsoft RPM repository (RHEL/CentOS)
+      ansible.builtin.yum_repository:
+        name: packages-microsoft-com-prod
+        description: "Microsoft PowerShell"
+        baseurl: "https://packages.microsoft.com/rhel/{{ ansible_distribution_major_version }}/prod/"
+        gpgcheck: true
+        gpgkey: "https://packages.microsoft.com/keys/microsoft.asc"
+        enabled: true
+        state: present
+      when:
+        - pwsh_check.rc != 0
+        - ansible_os_family == "RedHat"
+
+    - name: Install PowerShell Core via dnf
+      ansible.builtin.dnf:
+        name: powershell
+        state: present
+      when: pwsh_check.rc != 0
+
+    - name: Confirm pwsh version
+      ansible.builtin.command: pwsh --version
+      register: pwsh_version
+      changed_when: false
+
+    - name: Show pwsh version
+      ansible.builtin.debug:
+        msg: "PowerShell: {{ pwsh_version.stdout }}"
+
+# ---------------------------------------------------------------------------
+# PLAY 2 — Create CNAME records via PowerShell + service account
+# ---------------------------------------------------------------------------
+- name: "DNS | Create CNAME records on Windows DNS server"
+  hosts: "{{ target_vm_group | default('dns_cname_hosts') }}"
+  gather_facts: false
+
+  vars_files:
+    - ../vars/vault.yml
+    - ../vars/dns_vars.yml
+
+  vars:
+    # Override these per-run or via dns_vars.yml
+    # dns_server: "dc01.example.com"
+    # dns_zone:   "example.com"
+    # cname_records:
+    #   - alias: "app01"
+    #     target: "rhel9-auto-01.example.com."
+    #     ttl_seconds: 300
+    #     description: "App tier alias"
+
+  tasks:
+
+    # -----------------------------------------------------------------------
+    # Pre-flight: verify WinRM port reachable before attempting remote PS
+    # -----------------------------------------------------------------------
+    - name: Test WinRM connectivity from VM to DNS server
+      ansible.builtin.wait_for:
+        host: "{{ dns_server }}"
+        port: "{{ dns_winrm_port | default(5985) }}"
+        timeout: 10
+        msg: "Cannot reach DNS server {{ dns_server }}:{{ dns_winrm_port | default(5985) }} — check firewall rules"
+
+    # -----------------------------------------------------------------------
+    # Create each CNAME record in the list
+    # -----------------------------------------------------------------------
+    - name: Create CNAME record — {{ item.alias }}.{{ dns_zone }}
+      ansible.builtin.shell:
+        cmd: |
+          pwsh -NonInteractive -NoProfile -Command "
+            \$ErrorActionPreference = 'Stop'
+
+            # Build service-account credential
+            \$SecurePass = ConvertTo-SecureString '{{ vault_dns_svc_password }}' -AsPlainText -Force
+            \$Cred = [System.Management.Automation.PSCredential]::new(
+                '{{ vault_dns_svc_account }}', \$SecurePass
+            )
+
+            \$DnsServer  = '{{ dns_server }}'
+            \$ZoneName   = '{{ dns_zone }}'
+            \$AliasName  = '{{ item.alias }}'
+            \$TargetFqdn = '{{ item.target }}'
+            \$TtlSec     = {{ item.ttl_seconds | default(dns_default_ttl | default(300)) }}
+
+            # Check if the CNAME already exists
+            \$existing = Invoke-Command \`
+                -ComputerName \$DnsServer \`
+                -Credential   \$Cred \`
+                -ScriptBlock  {
+                    param(\$Zone, \$Name)
+                    Get-DnsServerResourceRecord \`
+                        -ZoneName     \$Zone \`
+                        -Name         \$Name \`
+                        -RRType       CName \`
+                        -ErrorAction  SilentlyContinue
+                } -ArgumentList \$ZoneName, \$AliasName
+
+            if (\$existing) {
+                \$currentTarget = \$existing.RecordData.HostNameAlias.TrimEnd('.')
+                Write-Output \"CNAME_EXISTS: \$AliasName.\$ZoneName -> \$currentTarget (no change)\"
+                exit 0
+            }
+
+            # Create the record
+            Invoke-Command \`
+                -ComputerName \$DnsServer \`
+                -Credential   \$Cred \`
+                -ScriptBlock  {
+                    param(\$Zone, \$Name, \$Target, \$Ttl)
+                    Add-DnsServerResourceRecordCName \`
+                        -ZoneName      \$Zone \`
+                        -Name          \$Name \`
+                        -HostNameAlias \$Target \`
+                        -TimeToLive    (New-TimeSpan -Seconds \$Ttl) \`
+                        -Confirm:\$false
+                    Write-Output \"CNAME_CREATED: \$Name.\$Zone -> \$Target (TTL: \${Ttl}s)\"
+                } -ArgumentList \$ZoneName, \$AliasName, \$TargetFqdn, \$TtlSec
+          "
+      register: cname_result
+      changed_when: "'CNAME_CREATED' in cname_result.stdout"
+      loop: "{{ cname_records }}"
+      loop_control:
+        label: "{{ item.alias }}.{{ dns_zone }} → {{ item.target }}"
+      no_log: false   # set true in production to hide svc password from output
+
+    # -----------------------------------------------------------------------
+    # Verify — resolve each CNAME from the VM using the domain DNS server
+    # -----------------------------------------------------------------------
+    - name: Verify CNAME resolves — {{ item.alias }}.{{ dns_zone }}
+      ansible.builtin.command:
+        cmd: >
+          pwsh -NonInteractive -NoProfile -Command
+          "Resolve-DnsName -Name '{{ item.alias }}.{{ dns_zone }}'
+           -Server '{{ dns_server }}' -Type CNAME -ErrorAction Stop |
+           Select-Object -ExpandProperty NameHost"
+      register: resolve_result
+      changed_when: false
+      retries: 3
+      delay: 5
+      until: resolve_result.rc == 0
+      loop: "{{ cname_records }}"
+      loop_control:
+        label: "{{ item.alias }}.{{ dns_zone }}"
+
+    # -----------------------------------------------------------------------
+    # Summary report
+    # -----------------------------------------------------------------------
+    - name: "REPORT | DNS CNAME Summary"
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      loop: >-
+        {%- set lines = [] -%}
+        {%- set _ = lines.append('') -%}
+        {%- set _ = lines.append('  DNS CNAME CREATION SUMMARY') -%}
+        {%- set _ = lines.append('  DNS Server : ' + dns_server) -%}
+        {%- set _ = lines.append('  Zone       : ' + dns_zone) -%}
+        {%- set _ = lines.append('  Auth       : ' + vault_dns_svc_account) -%}
+        {%- set _ = lines.append('  ==================================================================') -%}
+        {%- for r in cname_result.results -%}
+          {%- set status = 'CREATED' if r.changed else 'ALREADY EXISTS' -%}
+          {%- set resolved = resolve_result.results[loop.index0].stdout | default('unresolved') | trim -%}
+          {%- set _ = lines.append(
+            '  [' + status + ']  ' +
+            r.item.alias + '.' + dns_zone + '  →  ' + r.item.target +
+            '  (resolves: ' + resolved + ')'
+          ) -%}
+        {%- endfor -%}
+        {{ lines }}
+      loop_control:
+        label: "summary"

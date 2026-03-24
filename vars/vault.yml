@@ -28,3 +28,8 @@ vault_proxmox_validate_certs: false
 # Microsoft Teams incoming webhook URL for compute reports
 # Create via: Teams channel → Connectors → Incoming Webhook
 vault_teams_webhook_url: "https://YOURORG.webhook.office.com/webhookb2/CHANGE_ME"
+
+# DNS service account (must have "DNS Administrators" or delegated
+# create-record rights on the target zone in Active Directory)
+vault_dns_svc_account: "EXAMPLE\\svcDNS"   # Use \\ for backslash in YAML
+vault_dns_svc_password: "CHANGE_ME_STRONG"
