@@ -1,0 +1,44 @@
+# ------------------------------------------------------------
+# DNS CNAME Creation Variables
+# ------------------------------------------------------------
+# Used by: playbooks/dns_cname_create.yml
+# Credentials are in vars/vault.yml (vault_dns_svc_account,
+# vault_dns_svc_password)
+# ------------------------------------------------------------
+
+# Windows DNS server FQDN or IP (must be reachable via WinRM from the VM)
+dns_server: "dc01.example.com"
+
+# WinRM port on the DNS server (5985 = HTTP, 5986 = HTTPS)
+dns_winrm_port: 5985
+
+# DNS zone to create records in — should match vm_domain in rhel_vm_vars.yml
+dns_zone: "example.com"
+
+# Default TTL in seconds (300 = 5 min, 3600 = 1 hr)
+dns_default_ttl: 300
+
+# ---------------------------------------------------------------------------
+# CNAME records to create
+# Each entry:
+#   alias       — left-hand label (short name, no zone suffix)
+#   target      — canonical FQDN (must end with a trailing dot for absolute)
+#   ttl_seconds — optional; falls back to dns_default_ttl
+#   description — human note, not written to DNS
+# ---------------------------------------------------------------------------
+cname_records:
+  - alias: "app01"
+    target: "rhel9-auto-01.example.com."
+    ttl_seconds: 300
+    description: "Application tier alias for the provisioned VM"
+
+  - alias: "api"
+    target: "rhel9-auto-01.example.com."
+    ttl_seconds: 300
+    description: "API endpoint alias"
+
+  # Add more records here as needed:
+  # - alias: "monitoring"
+  #   target: "rhel9-auto-01.example.com."
+  #   ttl_seconds: 3600
+  #   description: "Monitoring endpoint"

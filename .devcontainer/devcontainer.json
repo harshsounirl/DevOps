@@ -1,0 +1,54 @@
+{
+  "name": "Ansible Proxmox DevContainer",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  // Mount the repo at /workspace
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+
+  // Forward SSH agent so Ansible can use your local SSH keys
+  "mounts": [
+    "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind",
+    "source=${localWorkspaceFolder}/vars,target=/workspace/vars,type=bind"
+  ],
+
+  "containerEnv": {
+    "SSH_AUTH_SOCK": "/ssh-agent",
+    "ANSIBLE_FORCE_COLOR": "1",
+    "ANSIBLE_HOST_KEY_CHECKING": "False"
+  },
+
+  // VS Code extensions useful for Ansible development
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "redhat.ansible",
+        "redhat.vscode-yaml",
+        "ms-python.python",
+        "github.vscode-github-actions",
+        "timonwong.shellcheck"
+      ],
+      "settings": {
+        "ansible.python.interpreterPath": "/usr/local/bin/python3",
+        "ansible.validation.enabled": true,
+        "ansible.validation.lint.enabled": true,
+        "editor.formatOnSave": true,
+        "[yaml]": {
+          "editor.defaultFormatter": "redhat.vscode-yaml"
+        }
+      }
+    }
+  },
+
+  // Run ansible --version on container start to confirm environment
+  "postCreateCommand": "ansible --version && ansible-galaxy collection list",
+
+  // Set non-root user
+  "remoteUser": "ansible",
+
+  // Port forwarding (not needed for Ansible but useful if serving reports)
+  "forwardPorts": []
+}

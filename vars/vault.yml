@@ -1,0 +1,35 @@
+# ------------------------------------------------------------
+# ANSIBLE VAULT - Proxmox Credentials
+# ------------------------------------------------------------
+# NEVER commit this file unencrypted.
+# Encrypt with:  ansible-vault encrypt vars/vault.yml
+# Edit later:    ansible-vault edit vars/vault.yml
+# View:          ansible-vault view vars/vault.yml
+# ------------------------------------------------------------
+
+# Proxmox connection
+vault_proxmox_host: "proxmox.example.com"       # FQDN or IP of Proxmox VE host
+vault_proxmox_port: 8006
+
+# Option A: username + password auth
+vault_proxmox_user: "root@pam"
+vault_proxmox_password: "CHANGE_ME"
+
+# Option B: API token auth (recommended - comment out A if using this)
+# vault_proxmox_token_id: "ansible"              # Token ID created in Proxmox UI
+# vault_proxmox_token_secret: "CHANGE_ME_UUID"   # Token secret UUID
+
+# SSH root/admin password set on the new VM via cloud-init
+vault_vm_root_password: "CHANGE_ME_STRONG_PASSWORD"
+
+# Optional: Proxmox API validate SSL cert (set false for self-signed certs)
+vault_proxmox_validate_certs: false
+
+# Microsoft Teams incoming webhook URL for compute reports
+# Create via: Teams channel → Connectors → Incoming Webhook
+vault_teams_webhook_url: "https://YOURORG.webhook.office.com/webhookb2/CHANGE_ME"
+
+# DNS service account (must have "DNS Administrators" or delegated
+# create-record rights on the target zone in Active Directory)
+vault_dns_svc_account: "EXAMPLE\\svcDNS"   # Use \\ for backslash in YAML
+vault_dns_svc_password: "CHANGE_ME_STRONG"

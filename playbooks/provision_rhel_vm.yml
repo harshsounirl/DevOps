@@ -1,0 +1,405 @@
+---
+# =============================================================================
+# Playbook: provision_rhel_vm.yml
+# Description:
+#   1. Clone an existing RHEL template in Proxmox via REST API
+#   2. Configure VM resources and cloud-init (IP, DNS, user, SSH keys)
+#   3. Start the VM and wait for SSH
+#   4. Run full DNF system update
+#   5. Install extra packages
+#   6. Create wheel-group users and deploy their SSH public keys
+#   7. Harden sudo and SSH config
+#
+# Requirements:
+#   ansible-galaxy collection install community.general ansible.posix
+#
+# Usage:
+#   ansible-playbook playbooks/provision_rhel_vm.yml \
+#     --vault-password-file ~/.vault_pass \
+#     -e @vars/rhel_vm_vars.yml
+# =============================================================================
+
+- name: "PLAY 1 | Provision RHEL VM via Proxmox API"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/vault.yml
+    - ../vars/rhel_vm_vars.yml
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # Validate required variables
+    # -------------------------------------------------------------------------
+    - name: Validate required vault variables are set
+      ansible.builtin.assert:
+        that:
+          - vault_proxmox_host is defined and vault_proxmox_host != "proxmox.example.com"
+          - vault_proxmox_user is defined
+          - vault_proxmox_password is defined
+          - vault_vm_root_password is defined and vault_vm_root_password != "CHANGE_ME_STRONG_PASSWORD"
+        fail_msg: >
+          Please update vars/vault.yml with real credentials and encrypt it:
+          ansible-vault encrypt vars/vault.yml
+        success_msg: "Vault variables validated."
+
+    # -------------------------------------------------------------------------
+    # Build cloud-init SSH keys string from ALL users' public keys
+    # (Proxmox accepts newline-separated authorized_keys format)
+    # -------------------------------------------------------------------------
+    - name: Build combined SSH authorized_keys for cloud-init
+      ansible.builtin.set_fact:
+        all_ssh_keys: "{{ vm_users | map(attribute='ssh_public_keys') | flatten | join('\n') }}"
+
+    # -------------------------------------------------------------------------
+    # Clone the RHEL template
+    # -------------------------------------------------------------------------
+    - name: Clone RHEL template to new VM
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ vault_proxmox_host }}"
+        api_port: "{{ vault_proxmox_port }}"
+        api_user: "{{ vault_proxmox_user }}"
+        api_password: "{{ vault_proxmox_password }}"
+        validate_certs: "{{ vault_proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        clone: "{{ template_vmid }}"          # VMID of the source template
+        vmid: "{{ new_vm_id }}"               # New VM's VMID
+        name: "{{ new_vm_name }}"
+        full: true                             # Full clone (not linked)
+        storage: "{{ proxmox_storage }}"
+        description: "{{ new_vm_description }}"
+        timeout: 300
+      register: clone_result
+
+    - name: Wait for clone task to complete
+      ansible.builtin.pause:
+        seconds: 10
+      when: clone_result.changed
+
+    # -------------------------------------------------------------------------
+    # Configure VM resources
+    # -------------------------------------------------------------------------
+    - name: Configure VM CPU, RAM, and options
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ vault_proxmox_host }}"
+        api_port: "{{ vault_proxmox_port }}"
+        api_user: "{{ vault_proxmox_user }}"
+        api_password: "{{ vault_proxmox_password }}"
+        validate_certs: "{{ vault_proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ new_vm_id }}"
+        cores: "{{ vm_cores }}"
+        sockets: "{{ vm_sockets }}"
+        memory: "{{ vm_memory_mb }}"
+        ostype: "{{ vm_os_type }}"
+        onboot: true
+        agent: "enabled=1"                    # Requires qemu-guest-agent in template
+        update: true
+
+    # -------------------------------------------------------------------------
+    # Configure cloud-init (network, credentials, SSH keys, upgrade)
+    # -------------------------------------------------------------------------
+    - name: Configure cloud-init settings
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ vault_proxmox_host }}"
+        api_port: "{{ vault_proxmox_port }}"
+        api_user: "{{ vault_proxmox_user }}"
+        api_password: "{{ vault_proxmox_password }}"
+        validate_certs: "{{ vault_proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ new_vm_id }}"
+        ciuser: "{{ vm_cloudinit_user }}"
+        cipassword: "{{ vault_vm_root_password }}"
+        sshkeys: "{{ all_ssh_keys }}"
+        ipconfig:
+          ipconfig0: "ip={{ vm_ip_cidr }},gw={{ vm_gateway }}"
+        nameservers:
+          - "{{ vm_dns1 }}"
+          - "{{ vm_dns2 }}"
+        searchdomains: "{{ vm_domain }}"
+        ciupgrade: "{{ vm_cloudinit_upgrade }}"
+        update: true
+
+    # -------------------------------------------------------------------------
+    # Resize disk if requested
+    # -------------------------------------------------------------------------
+    - name: Resize VM disk
+      community.proxmox.proxmox_disk:
+        api_host: "{{ vault_proxmox_host }}"
+        api_port: "{{ vault_proxmox_port }}"
+        api_user: "{{ vault_proxmox_user }}"
+        api_password: "{{ vault_proxmox_password }}"
+        validate_certs: "{{ vault_proxmox_validate_certs }}"
+        vmid: "{{ new_vm_id }}"
+        disk: "scsi0"
+        size: "{{ vm_disk_size }}"
+        state: resized
+      when: vm_disk_size is defined and vm_disk_size | length > 0
+
+    # -------------------------------------------------------------------------
+    # Start the VM
+    # -------------------------------------------------------------------------
+    - name: Start the VM
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ vault_proxmox_host }}"
+        api_port: "{{ vault_proxmox_port }}"
+        api_user: "{{ vault_proxmox_user }}"
+        api_password: "{{ vault_proxmox_password }}"
+        validate_certs: "{{ vault_proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ new_vm_id }}"
+        state: started
+
+    # -------------------------------------------------------------------------
+    # Wait for SSH to become available
+    # -------------------------------------------------------------------------
+    - name: Wait for SSH port to be reachable
+      ansible.builtin.wait_for:
+        host: "{{ vm_ip_cidr | ansible.utils.ipaddr('address') }}"
+        port: 22
+        state: started
+        delay: 15
+        timeout: 300
+      register: ssh_wait
+
+    - name: Add new VM to in-memory inventory
+      ansible.builtin.add_host:
+        name: "{{ new_vm_name }}"
+        groups: newly_provisioned
+        ansible_host: "{{ vm_ip_cidr | ansible.utils.ipaddr('address') }}"
+        ansible_user: "{{ vm_cloudinit_user }}"
+        ansible_ssh_private_key_file: "{{ ansible_ssh_private_key_file }}"
+        ansible_become: true
+        ansible_become_method: sudo
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+    - name: Display VM provisioning summary
+      ansible.builtin.debug:
+        msg:
+          - "VM '{{ new_vm_name }}' (VMID: {{ new_vm_id }}) created successfully."
+          - "IP Address : {{ vm_ip_cidr | ansible.utils.ipaddr('address') }}"
+          - "SSH User   : {{ vm_cloudinit_user }}"
+          - "Proceeding to OS configuration..."
+
+
+# =============================================================================
+# PLAY 2 | Configure RHEL OS — Update, Users, SSH Keys
+# =============================================================================
+- name: "PLAY 2 | Configure RHEL VM — updates, users, SSH keys"
+  hosts: newly_provisioned
+  gather_facts: true
+
+  vars_files:
+    - ../vars/vault.yml
+    - ../vars/rhel_vm_vars.yml
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # Ensure subscription is attached (skip if using custom/local repos)
+    # -------------------------------------------------------------------------
+    - name: Check Red Hat subscription status
+      ansible.builtin.command: subscription-manager status
+      register: sub_status
+      failed_when: false
+      changed_when: false
+
+    - name: Register with Red Hat (if not already registered)
+      community.general.redhat_subscription:
+        state: present
+        auto_attach: true
+      when:
+        - sub_status.rc != 0
+        - rhsm_username is defined             # Set rhsm_username/rhsm_password in vault if needed
+      vars:
+        rhsm_username: "{{ vault_rhsm_username | default('') }}"
+        rhsm_password: "{{ vault_rhsm_password | default('') }}"
+      ignore_errors: true                      # Non-fatal — may be using local repos
+
+    # -------------------------------------------------------------------------
+    # Full system update
+    # -------------------------------------------------------------------------
+    - name: Clean DNF cache
+      ansible.builtin.dnf:
+        update_cache: true
+
+    - name: Full system update (dnf update -y)
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        update_only: false
+      register: dnf_update_result
+
+    - name: Report update results
+      ansible.builtin.debug:
+        msg: "DNF update complete — {{ dnf_update_result.results | default(['No packages updated']) | length }} package(s) changed."
+
+    # -------------------------------------------------------------------------
+    # Install extra packages
+    # -------------------------------------------------------------------------
+    - name: Install extra packages
+      ansible.builtin.dnf:
+        name: "{{ extra_packages }}"
+        state: present
+
+    # -------------------------------------------------------------------------
+    # Ensure wheel group exists and sudo is configured
+    # -------------------------------------------------------------------------
+    - name: Ensure wheel group exists
+      ansible.builtin.group:
+        name: wheel
+        state: present
+
+    - name: Ensure wheel group has passwordless sudo
+      ansible.builtin.lineinfile:
+        path: /etc/sudoers.d/wheel-nopasswd
+        line: "%wheel ALL=(ALL) NOPASSWD: ALL"
+        create: true
+        mode: "0440"
+        validate: "/usr/sbin/visudo -cf %s"
+
+    # -------------------------------------------------------------------------
+    # Create users and add to wheel group
+    # -------------------------------------------------------------------------
+    - name: Create users and add to wheel group
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        comment: "{{ item.comment | default(item.name) }}"
+        groups: wheel
+        append: true
+        shell: /bin/bash
+        create_home: true
+        state: present
+      loop: "{{ vm_users }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # -------------------------------------------------------------------------
+    # Deploy SSH public keys for each user
+    # -------------------------------------------------------------------------
+    - name: Deploy SSH public keys for each user
+      ansible.posix.authorized_key:
+        user: "{{ item.0.name }}"
+        key: "{{ item.1 }}"
+        state: present
+        exclusive: false                       # Append; do not wipe existing keys
+      loop: "{{ vm_users | subelements('ssh_public_keys') }}"
+      loop_control:
+        label: "{{ item.0.name }} — key {{ idx + 1 }}"
+        index_var: idx
+
+    # -------------------------------------------------------------------------
+    # Harden SSH daemon config
+    # -------------------------------------------------------------------------
+    - name: Harden SSH — disable root login
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?PermitRootLogin"
+        line: "PermitRootLogin no"
+        backup: true
+      notify: Restart sshd
+
+    - name: Harden SSH — disable password authentication
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?PasswordAuthentication"
+        line: "PasswordAuthentication no"
+        backup: true
+      notify: Restart sshd
+
+    - name: Harden SSH — enable public key authentication
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?PubkeyAuthentication"
+        line: "PubkeyAuthentication yes"
+        backup: true
+      notify: Restart sshd
+
+    # -------------------------------------------------------------------------
+    # Enable and start services
+    # -------------------------------------------------------------------------
+    - name: Enable and start firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        enabled: true
+        state: started
+
+    - name: Enable and start chronyd (NTP)
+      ansible.builtin.systemd:
+        name: chronyd
+        enabled: true
+        state: started
+
+    # -------------------------------------------------------------------------
+    # Reboot if kernel was updated
+    # -------------------------------------------------------------------------
+    - name: Check if reboot is required (new kernel installed)
+      ansible.builtin.command: >
+        needs-restarting -r
+      register: reboot_check
+      failed_when: false
+      changed_when: false
+
+    - name: Reboot VM if kernel was updated
+      ansible.builtin.reboot:
+        msg: "Rebooting after kernel update"
+        reboot_timeout: 300
+        pre_reboot_delay: 5
+        post_reboot_delay: 15
+      when: reboot_check.rc == 1
+
+    # -------------------------------------------------------------------------
+    # Final validation
+    # -------------------------------------------------------------------------
+    - name: Verify users exist and are in wheel group
+      ansible.builtin.command: "id {{ item.name }}"
+      register: user_check
+      changed_when: false
+      loop: "{{ vm_users }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display user verification results
+      ansible.builtin.debug:
+        msg: "{{ item.stdout }}"
+      loop: "{{ user_check.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Verify SSH authorized_keys exist
+      ansible.builtin.stat:
+        path: "/home/{{ item.name }}/.ssh/authorized_keys"
+      register: key_stat
+      loop: "{{ vm_users }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Confirm SSH keys deployed
+      ansible.builtin.debug:
+        msg: "authorized_keys for '{{ item.item.name }}': {{ 'PRESENT' if item.stat.exists else 'MISSING' }}"
+      loop: "{{ key_stat.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Final provisioning summary
+      ansible.builtin.debug:
+        msg:
+          - "=================================================="
+          - " RHEL VM Provisioning Complete"
+          - "=================================================="
+          - "Hostname   : {{ new_vm_name }}"
+          - "IP Address : {{ vm_ip_cidr | ansible.utils.ipaddr('address') }}"
+          - "OS         : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel     : {{ ansible_kernel }}"
+          - "Users      : {{ vm_users | map(attribute='name') | list | join(', ') }}"
+          - "Groups     : wheel (sudo)"
+          - "SSH Auth   : Public key only"
+          - "=================================================="
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.systemd:
+        name: sshd
+        state: restarted

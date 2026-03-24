@@ -1,0 +1,7 @@
+# Python dependencies for Ansible Proxmox playbooks
+ansible>=9.0.0
+netaddr>=1.3.0          # required for ansible.utils.ipaddr filter
+proxmoxer>=2.0.0        # optional: used by community.proxmox collection
+requests>=2.31.0        # proxmoxer dependency
+paramiko>=3.4.0         # SSH connections
+jmespath>=1.0.1         # required for json_query filter
